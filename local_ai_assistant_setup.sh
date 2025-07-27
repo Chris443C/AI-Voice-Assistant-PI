@@ -128,12 +128,58 @@ update_system() {
         unzip \
         htop \
         nano \
-        screen
+        screen \
+        ufw \
+        yamllint \
+        fail2ban
+}
+
+setup_home_security() {
+    log "Setting up basic home security..."
+    
+    # Install and configure UFW firewall
+    if ! command -v ufw &> /dev/null; then
+        sudo apt install -y ufw
+    fi
+    
+    # Reset and configure firewall
+    sudo ufw --force reset
+    sudo ufw default deny incoming
+    sudo ufw default allow outgoing
+    
+    # Allow SSH (adjust port if needed)
+    sudo ufw allow ssh comment "SSH Access"
+    
+    # Allow Home Assistant web interface
+    sudo ufw allow 8123/tcp comment "Home Assistant Web Interface"
+    
+    # Allow Wyoming services (restrict to localhost)
+    sudo ufw allow from 127.0.0.1 to any port 10200 comment "Piper TTS"
+    sudo ufw allow from 127.0.0.1 to any port 10300 comment "Whisper STT"
+    sudo ufw allow from 127.0.0.1 to any port 10400 comment "OpenWakeWord"
+    
+    # Allow Ollama API (restrict to localhost)
+    sudo ufw allow from 127.0.0.1 to any port 11434 comment "Ollama API"
+    
+    # Enable firewall
+    sudo ufw --force enable
+    
+    log "Firewall configured successfully"
+    
+    # Configure fail2ban for SSH protection
+    sudo systemctl enable fail2ban
+    sudo systemctl start fail2ban
+    
+    log "Basic security setup complete"
 }
 
 setup_audio_pi() {
     if [[ "$DEVICE_TYPE" =~ ^pi ]]; then
         log "Setting up ReSpeaker 2-Mic Pi HAT..."
+        
+        # Enable I2C and SPI for ReSpeaker HAT
+        sudo raspi-config nonint do_i2c 0
+        sudo raspi-config nonint do_spi 0
         
         # Install ReSpeaker drivers
         cd /tmp
@@ -153,6 +199,11 @@ ctl.!default {
     card seeedvoicecard
 }
 EOF
+        
+        # Optimize Pi performance for audio
+        echo "gpu_mem=128" | sudo tee -a /boot/config.txt
+        echo "arm_freq=1800" | sudo tee -a /boot/config.txt
+        echo "over_voltage=2" | sudo tee -a /boot/config.txt
         
         log "Audio setup complete. Reboot required after installation."
     fi
@@ -210,19 +261,26 @@ source bin/activate
 pip install --upgrade homeassistant
 EOF
         
-        # Create systemd service
-        sudo tee /etc/systemd/system/home-assistant@homeassistant.service > /dev/null <<EOF
+            # Create systemd service with improved reliability
+    sudo tee /etc/systemd/system/home-assistant@homeassistant.service > /dev/null <<EOF
 [Unit]
 Description=Home Assistant
 After=network-online.target
 Wants=network-online.target
+Requires=wyoming-whisper.service wyoming-piper.service wyoming-openwakeword.service
 
 [Service]
 Type=exec
 User=%i
 WorkingDirectory=/srv/homeassistant
 ExecStart=/srv/homeassistant/bin/hass -c "/srv/homeassistant/.homeassistant"
-RestartForceExitStatus=100
+Restart=always
+RestartSec=10
+TimeoutStartSec=60
+TimeoutStopSec=30
+LimitNOFILE=65536
+LimitNPROC=4096
+MemoryMax=2G
 
 [Install]
 WantedBy=multi-user.target
@@ -252,7 +310,7 @@ model = whisper.load_model('$WHISPER_MODEL')
 print(f'Whisper model $WHISPER_MODEL downloaded successfully')
 "
     
-    # Create Whisper service
+    # Create Whisper service with security hardening
     sudo tee /etc/systemd/system/wyoming-whisper.service > /dev/null <<EOF
 [Unit]
 Description=Wyoming Whisper
@@ -261,10 +319,17 @@ After=network-online.target
 
 [Service]
 Type=exec
-ExecStart=$PYTHON_VENV/bin/python -m wyoming_faster_whisper --model $WHISPER_MODEL --language en --uri tcp://0.0.0.0:10300
+ExecStart=$PYTHON_VENV/bin/python -m wyoming_faster_whisper --model $WHISPER_MODEL --language en --uri tcp://127.0.0.1:10300
 Restart=always
-RestartSec=1
+RestartSec=10
 User=$USER
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp /var/tmp
+LimitNOFILE=65536
+MemoryMax=1G
 
 [Install]
 WantedBy=default.target
@@ -288,7 +353,7 @@ install_wyoming_piper() {
     wget -O "${PIPER_VOICE}.onnx" "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
     wget -O "${PIPER_VOICE}.onnx.json" "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
     
-    # Create Piper service
+    # Create Piper service with security hardening
     sudo tee /etc/systemd/system/wyoming-piper.service > /dev/null <<EOF
 [Unit]
 Description=Wyoming Piper
@@ -297,10 +362,17 @@ After=network-online.target
 
 [Service]
 Type=exec
-ExecStart=$PYTHON_VENV/bin/python -m wyoming_piper --piper '$CONFIG_DIR/models/piper/${PIPER_VOICE}.onnx' --uri tcp://0.0.0.0:10200
+ExecStart=$PYTHON_VENV/bin/python -m wyoming_piper --piper '$CONFIG_DIR/models/piper/${PIPER_VOICE}.onnx' --uri tcp://127.0.0.1:10200
 Restart=always
-RestartSec=1
+RestartSec=10
 User=$USER
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp /var/tmp
+LimitNOFILE=65536
+MemoryMax=1G
 
 [Install]
 WantedBy=default.target
@@ -316,7 +388,7 @@ install_wyoming_openwakeword() {
     source "$PYTHON_VENV/bin/activate"
     pip install wyoming-openwakeword
     
-    # Create OpenWakeWord service
+    # Create OpenWakeWord service with security hardening
     sudo tee /etc/systemd/system/wyoming-openwakeword.service > /dev/null <<EOF
 [Unit]
 Description=Wyoming OpenWakeWord
@@ -325,10 +397,17 @@ After=network-online.target
 
 [Service]
 Type=exec
-ExecStart=$PYTHON_VENV/bin/python -m wyoming_openwakeword --uri tcp://0.0.0.0:10400
+ExecStart=$PYTHON_VENV/bin/python -m wyoming_openwakeword --uri tcp://127.0.0.1:10400
 Restart=always
-RestartSec=1
+RestartSec=10
 User=$USER
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp /var/tmp
+LimitNOFILE=65536
+MemoryMax=1G
 
 [Install]
 WantedBy=default.target
@@ -349,11 +428,13 @@ install_ollama() {
         # Install Ollama
         curl -fsSL https://ollama.ai/install.sh | sh
         
-        # Create Ollama service override for network access
-        sudo mkdir -p /etc/systemd/system/ollama.service.d/
-        sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null <<EOF
+            # Create Ollama service override for local network access
+    sudo mkdir -p /etc/systemd/system/ollama.service.d/
+    sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null <<EOF
 [Service]
-Environment="OLLAMA_HOST=0.0.0.0:11434"
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+LimitNOFILE=65536
+MemoryMax=4G
 EOF
         
         sudo systemctl daemon-reload
@@ -381,9 +462,9 @@ configure_homeassistant() {
     HA_CONFIG="/srv/homeassistant/.homeassistant"
     sudo mkdir -p "$HA_CONFIG"
     
-    # Create basic configuration.yaml
+    # Create enhanced configuration.yaml with home network support
     sudo tee "$HA_CONFIG/configuration.yaml" > /dev/null <<EOF
-# Basic Home Assistant Configuration for AI Voice Assistant
+# Enhanced Home Assistant Configuration for AI Voice Assistant
 homeassistant:
   name: "AI Assistant Home"
   latitude: !secret home_latitude
@@ -429,12 +510,16 @@ script: !include scripts.yaml
 # Scenes
 scene: !include scenes.yaml
 
-# HTTP configuration
+# HTTP configuration with home network support
 http:
   use_x_forwarded_for: true
   trusted_proxies:
     - 127.0.0.1
     - ::1
+    - 192.168.1.0/24
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+  cache_control: true
 
 # Logger
 logger:
@@ -442,13 +527,29 @@ logger:
   logs:
     homeassistant.components.assist_pipeline: debug
     homeassistant.components.wyoming: debug
+
+# Recorder for data persistence
+recorder:
+  db_url: !secret db_url
+  purge_keep_days: 30
+  auto_purge: true
+  commit_interval: 1
+  max_queue_size: 10000
+
+# History
+history:
+
+# Logbook
+logbook:
 EOF
 
-    # Create secrets.yaml template
+    # Create enhanced secrets.yaml template
     sudo tee "$HA_CONFIG/secrets.yaml" > /dev/null <<EOF
 # Home Assistant Secrets
 home_latitude: 0.0
 home_longitude: 0.0
+db_url: "sqlite:////srv/homeassistant/.homeassistant/home-assistant_v2.db"
+api_password: "your_secure_password_here"
 EOF
 
     # Create empty automation files
@@ -514,10 +615,19 @@ create_test_scripts() {
     # Audio test script
     cat > "$CONFIG_DIR/scripts/test_audio.sh" <<EOF
 #!/bin/bash
+echo "Testing audio devices..."
+aplay -l
+arecord -l
+
 echo "Testing microphone..."
-arecord -D plughw:seeedvoicecard,0 -f cd -t wav -d 5 test_recording.wav
+arecord -D plughw:seeedvoicecard,0 -f cd -t wav -d 3 test_recording.wav
+
 echo "Testing speakers..."
 aplay test_recording.wav
+
+echo "Testing audio quality..."
+ffmpeg -i test_recording.wav -af "volumedetect" -f null /dev/null 2>&1 | grep "mean_volume"
+
 rm test_recording.wav
 echo "Audio test complete"
 EOF
@@ -533,8 +643,70 @@ if [[ "$INSTALL_OLLAMA" == true ]]; then
     echo "Ollama: \$(curl -s http://localhost:11434/api/version | jq -r '.version // "Not responding"')"
 fi
 EOF
+
+    # Service monitoring script
+    cat > "$CONFIG_DIR/scripts/monitor_services.sh" <<EOF
+#!/bin/bash
+# Simple home monitoring - restart services if they fail
+SERVICES=("wyoming-whisper" "wyoming-piper" "wyoming-openwakeword" "ollama")
+
+for service in "\${SERVICES[@]}"; do
+    if ! systemctl is-active --quiet "\$service"; then
+        echo "\$(date): Restarting \$service"
+        sudo systemctl restart "\$service"
+    fi
+done
+EOF
+
+    # Configuration validation script
+    cat > "$CONFIG_DIR/scripts/validate_config.sh" <<EOF
+#!/bin/bash
+echo "Validating Home Assistant configuration..."
+hass --script check_config
+
+echo "Validating YAML syntax..."
+yamllint /srv/homeassistant/.homeassistant/
+
+echo "Checking service dependencies..."
+systemctl list-dependencies home-assistant@homeassistant.service
+EOF
+
+    # Backup script
+    cat > "$CONFIG_DIR/scripts/backup.sh" <<EOF
+#!/bin/bash
+# Backup script for voice assistant
+BACKUP_DIR="\$HOME/.ai_assistant/backups"
+DATE=\$(date +%Y%m%d_%H%M%S)
+BACKUP_NAME="voice_assistant_backup_\$DATE.tar.gz"
+
+# Create backup directory
+mkdir -p "\$BACKUP_DIR"
+
+# Create backup
+tar -czf "\$BACKUP_DIR/\$BACKUP_NAME" \\
+    -C /srv/homeassistant .homeassistant \\
+    -C "\$HOME" .ai_assistant \\
+    --exclude='*.log' \\
+    --exclude='*.tmp' \\
+    --exclude='__pycache__'
+
+# Keep only last 5 backups
+cd "\$BACKUP_DIR"
+ls -t *.tar.gz | tail -n +6 | xargs -r rm
+
+echo "Backup created: \$BACKUP_NAME"
+EOF
     
     chmod +x "$CONFIG_DIR/scripts/"*.sh
+
+    # Set up monitoring cron job
+    (crontab -l 2>/dev/null; echo "*/5 * * * * $CONFIG_DIR/scripts/monitor_services.sh") | crontab -
+    
+    # Copy comprehensive test script
+    cp "$SCRIPT_DIR/test_voice_pipeline.py" "$CONFIG_DIR/scripts/"
+    chmod +x "$CONFIG_DIR/scripts/test_voice_pipeline.py"
+    
+    log "Test scripts and monitoring created"
 }
 
 print_completion_info() {
@@ -552,13 +724,22 @@ print_completion_info() {
     info ""
     info "Next Steps:"
     info "1. Reboot your system: sudo reboot"
-    info "2. After reboot, check services: $CONFIG_DIR/scripts/test_services.sh"
+    info "2. After reboot, run comprehensive test: $CONFIG_DIR/scripts/test_voice_pipeline.py"
     info "3. Test audio: $CONFIG_DIR/scripts/test_audio.sh"
+    info "4. Validate configuration: $CONFIG_DIR/scripts/validate_config.sh"
     if [[ "$INSTALL_HOMEASSISTANT" == true ]]; then
-        info "4. Access Home Assistant: http://localhost:8123"
-        info "5. Complete Home Assistant onboarding"
-        info "6. Add Wyoming integrations in HA"
+        info "5. Access Home Assistant: http://localhost:8123"
+        info "6. Complete Home Assistant onboarding"
+        info "7. Add Wyoming integrations in HA"
     fi
+    info ""
+    info "Security Features Enabled:"
+    info "- Firewall configured (UFW)"
+    info "- SSH protection (fail2ban)"
+    info "- Services restricted to localhost"
+    info "- Automatic service monitoring"
+    info "- Configuration validation"
+    info "- Automated backups"
     info ""
     info "Service URLs:"
     info "- Whisper: http://localhost:10300"
@@ -663,6 +844,7 @@ main() {
     
     # System preparation
     update_system
+    setup_home_security
     setup_audio_pi
     create_directories
     

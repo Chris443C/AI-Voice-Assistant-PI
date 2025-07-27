@@ -168,12 +168,16 @@ sensor:
             mdi:microphone-off
           {% endif %}
 
-# HTTP configuration
+# HTTP configuration with home network support
 http:
   use_x_forwarded_for: true
   trusted_proxies:
     - 127.0.0.1
     - ::1
+    - 192.168.1.0/24
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+  cache_control: true
 
 # Logging
 logger:
@@ -185,10 +189,13 @@ logger:
     homeassistant.components.intent: debug
     homeassistant.components.tts: debug
 
-# Recorder
+# Recorder with enhanced configuration
 recorder:
-  purge_keep_days: 30
   db_url: !secret db_url
+  purge_keep_days: 30
+  auto_purge: true
+  commit_interval: 1
+  max_queue_size: 10000
   include:
     domains:
       - sensor

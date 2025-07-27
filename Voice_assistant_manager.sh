@@ -773,33 +773,71 @@ EOF
 }
 
 create_systemd_service_monitoring() {
-    log "Setting up service monitoring..."
+    log "Setting up enhanced service monitoring..."
     
-    # Create service monitor script
+    # Create service monitor script with better error handling
     cat > "$CONFIG_DIR/scripts/monitor_services.sh" <<'EOF'
 #!/bin/bash
 
-# Service monitoring script for voice assistant
+# Enhanced service monitoring script for voice assistant
 SERVICES=("wyoming-whisper" "wyoming-piper" "wyoming-openwakeword" "ollama" "home-assistant@homeassistant")
 LOG_FILE="$HOME/.ai_assistant/service_monitor.log"
+ALERT_FILE="$HOME/.ai_assistant/service_alerts.log"
 
 log_message() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
+alert_message() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] ALERT: $1" >> "$ALERT_FILE"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] ALERT: $1" >> "$LOG_FILE"
+}
+
 check_and_restart() {
     local service=$1
+    local max_attempts=3
+    local attempt=1
     
     if ! systemctl is-active --quiet "$service"; then
-        log_message "Service $service is down, attempting restart..."
-        sudo systemctl restart "$service"
+        log_message "Service $service is down, attempting restart (attempt $attempt/$max_attempts)..."
         
-        sleep 10
+        while [[ $attempt -le $max_attempts ]]; do
+            sudo systemctl restart "$service"
+            sleep 10
+            
+            if systemctl is-active --quiet "$service"; then
+                log_message "Service $service restarted successfully"
+                return 0
+            else
+                log_message "Restart attempt $attempt failed for $service"
+                ((attempt++))
+            fi
+        done
         
-        if systemctl is-active --quiet "$service"; then
-            log_message "Service $service restarted successfully"
-        else
-            log_message "Failed to restart service $service"
+        alert_message "Failed to restart service $service after $max_attempts attempts"
+        return 1
+    fi
+}
+
+# Check system resources
+check_system_health() {
+    # Check disk space
+    disk_usage=$(df / | awk 'NR==2 {print $5}' | sed 's/%//')
+    if [[ $disk_usage -gt 90 ]]; then
+        alert_message "Disk usage critical: ${disk_usage}%"
+    fi
+    
+    # Check memory usage
+    memory_usage=$(free | awk 'NR==2{printf "%.0f", $3*100/$2}')
+    if [[ $memory_usage -gt 90 ]]; then
+        alert_message "Memory usage critical: ${memory_usage}%"
+    fi
+    
+    # Check CPU temperature (Raspberry Pi)
+    if [[ -f /sys/class/thermal/thermal_zone0/temp ]]; then
+        temp=$(($(cat /sys/class/thermal/thermal_zone0/temp) / 1000))
+        if [[ $temp -gt 80 ]]; then
+            alert_message "CPU temperature high: ${temp}°C"
         fi
     fi
 }
@@ -809,16 +847,24 @@ for service in "${SERVICES[@]}"; do
     check_and_restart "$service"
 done
 
+# Check system health
+check_system_health
+
 # Check if all Wyoming services can be reached
-python3 "$HOME/.ai_assistant/scripts/check_services.py" >> "$LOG_FILE" 2>&1
+if command -v python3 &> /dev/null; then
+    python3 "$HOME/.ai_assistant/scripts/check_services.py" >> "$LOG_FILE" 2>&1
+fi
 EOF
 
     chmod +x "$CONFIG_DIR/scripts/monitor_services.sh"
     
-    # Create cron job for monitoring
+    # Create cron job for monitoring (every 5 minutes)
     (crontab -l 2>/dev/null; echo "*/5 * * * * $CONFIG_DIR/scripts/monitor_services.sh") | crontab -
     
-    log "Service monitoring configured"
+    # Create backup cron job (daily at 2 AM)
+    (crontab -l 2>/dev/null; echo "0 2 * * * $CONFIG_DIR/scripts/backup.sh") | crontab -
+    
+    log "Enhanced service monitoring configured"
 }
 
 configure_wyoming_integrations() {
